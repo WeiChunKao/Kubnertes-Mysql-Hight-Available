@@ -1,0 +1,389 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-client-provisioner
+  # replace with namespace where provisioner is deployed
+  namespace: msyqlha
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nfs-client-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: run-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    # replace with namespace where provisioner is deployed
+    namespace: msyqlha
+roleRef:
+  kind: ClusterRole
+  name: nfs-client-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+  # replace with namespace where provisioner is deployed
+  namespace: msyqlha
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+  # replace with namespace where provisioner is deployed
+  namespace: msyqlha
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    # replace with namespace where provisioner is deployed
+    namespace: msyqlha
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-client-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-nfs-storage
+  namespace: msyqlha
+provisioner: k8s-sigs.io/nfs-subdir-external-provisioner # or choose another name, must match deployment's env PROVISIONER_NAME'
+parameters:
+  archiveOnDelete: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-client-provisioner
+  labels:
+    app: nfs-client-provisioner
+  # replace with namespace where provisioner is deployed
+  namespace: msyqlha
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-client-provisioner
+  template:
+    metadata:
+      labels:
+        app: nfs-client-provisioner
+    spec:
+      serviceAccountName: nfs-client-provisioner
+      containers:
+        - name: nfs-client-provisioner
+          image: k8s.gcr.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "250m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: nfs-client-root
+              mountPath: /persistentvolumes
+          env:
+            - name: PROVISIONER_NAME
+              value: k8s-sigs.io/nfs-subdir-external-provisioner
+            - name: NFS_SERVER
+              value: 192.168.0.100
+            - name: NFS_PATH
+              value: /etc/nfs
+      volumes:
+        - name: nfs-client-root
+          nfs:
+            server: 192.168.0.100
+            path: /etc/nfs
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql
+  namespace: msyqlha
+  labels:
+    app: mysql
+data:
+  master.cnf: |
+    # Master配置
+    [mysqld]
+    log-bin=mysqllog
+    skip-name-resolve
+    read_only = 0
+    super_read_only = 0
+  slave.cnf: |
+    # Slave配置
+    [mysqld]
+    #super-read-only
+    skip-name-resolve
+    log-bin=mysql-bin
+    replicate-ignore-db=mysql
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: msyqlha
+  labels:
+    app: mysql
+type: Opaque
+data:
+  password: MTIzNDU2 # echo -n "123456" | base64
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: msyqlha
+  labels:
+    app: mysql
+spec:
+  type: LoadBalancer #NodePort
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+    nodePort: 32760
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  namespace: msyqlha
+  labels:
+    app: mysql
+spec:
+  type: NodePort
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+    nodePort: 32761
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: msyqlha
+  labels:
+    app: mysql
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  serviceName: mysql
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      initContainers:
+      - name: init-mysql
+        image: mysql:5.7
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: password
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # 从Pod的序号，生成server-id
+          [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          echo [mysqld] > /mnt/conf.d/server-id.cnf
+          # 由于server-id不能为0，因此给ID加100来避开它
+          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          # 如果Pod的序号为0，说明它是Master节点，从ConfigMap里把Master的配置文件拷贝到/mnt/conf.d目录下
+          # 否则，拷贝ConfigMap里的Slave的配置文件
+          if [[ ${ordinal} -eq 0 ]]; then
+            cp /mnt/config-map/master.cnf /mnt/conf.d
+          else
+            cp /mnt/config-map/slave.cnf /mnt/conf.d
+          fi
+        volumeMounts:
+        - name: conf
+          mountPath: /mnt/conf.d
+        - name: config-map
+          mountPath: /mnt/config-map
+      - name: clone-mysql
+        image: gcr.io/google-samples/xtrabackup:1.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: password
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # 拷贝操作只需要在第一次启动时进行，所以数据已经存在则跳过
+          [[ -d /var/lib/mysql/mysql ]] && exit 0
+          # Master 节点（序号为 0）不需要这个操作
+          [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          [[ $ordinal == 0 ]] && exit 0
+          # 使用ncat指令，远程地从前一个节点拷贝数据到本地
+          ncat --recv-only mysql-$(($ordinal-1)).mysql 3307 | xbstream -x -C /var/lib/mysql
+          # 执行 --prepare，这样拷贝来的数据就可以用作恢复了
+          xtrabackup --prepare --target-dir=/var/lib/mysql
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+      containers:
+      - name: mysql
+        image: mysql:5.7
+        env:
+ #        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+ #          value: "1"
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: password
+        ports:
+        - name: mysql
+          containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+      - name: xtrabackup
+        image: gcr.io/google-samples/xtrabackup:1.0
+        ports:
+        - name: xtrabackup
+          containerPort: 3307
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: password
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          cd /var/lib/mysql
+          # 从备份信息文件里读取MASTER_LOG_FILE和MASTER_LOG_POS这2个字段的值，用来拼装集群初始化SQL
+          if [[ -f xtrabackup_slave_info ]]; then
+            # 如果xtrabackup_slave_info文件存在，说明这个备份数据来自于另一个Slave节点
+            # 这种情况下，XtraBackup工具在备份的时候，就已经在这个文件里自动生成了“CHANGE MASTER TO”SQL语句
+            # 所以，只需要把这个文件重命名为change_master_to.sql.in，后面直接使用即可
+            mv xtrabackup_slave_info change_master_to.sql.in
+            # 所以，也就用不着xtrabackup_binlog_info了
+            rm -f xtrabackup_binlog_info
+          elif [[ -f xtrabackup_binlog_info ]]; then
+            # 如果只是存在xtrabackup_binlog_info文件，说明备份来自于Master节点，就需要解析这个备份信息文件，读取所需的两个字段的值
+            [[ $(cat xtrabackup_binlog_info) =~ ^(.*?)[[:space:]]+(.*?)$ ]] || exit 1
+            rm xtrabackup_binlog_info
+            # 把两个字段的值拼装成SQL，写入change_master_to.sql.in文件
+            echo "CHANGE MASTER TO MASTER_LOG_FILE='${BASH_REMATCH[1]}',\
+                  MASTER_LOG_POS=${BASH_REMATCH[2]}" > change_master_to.sql.in
+          fi
+          # 如果存在change_master_to.sql.in，就意味着需要做集群初始化工作
+          if [[ -f change_master_to.sql.in ]]; then
+            # 但一定要先等MySQL容器启动之后才能进行下一步连接MySQL的操作
+            echo "Waiting for mysqld to be ready（accepting connections）"
+            until mysql -h 127.0.0.1 -uroot -p${MYSQL_ROOT_PASSWORD} -e "SELECT 1"; do sleep 1; done
+            echo "Initializing replication from clone position"
+            # 将文件change_master_to.sql.in改个名字
+            # 防止这个Container重启的时候，因为又找到了change_master_to.sql.in，从而重复执行一遍初始化流程
+            mv change_master_to.sql.in change_master_to.sql.orig
+            # 使用change_master_to.sql.orig的内容，也就是前面拼装的SQL，组成一个完整的初始化和启动Slave的SQL语句
+            mysql -h 127.0.0.1 -uroot -p${MYSQL_ROOT_PASSWORD} << EOF
+          $(< change_master_to.sql.orig),
+            MASTER_HOST='mysql-0.mysql.mysql',
+            MASTER_USER='root',
+            MASTER_PASSWORD='${MYSQL_ROOT_PASSWORD}',
+            MASTER_CONNECT_RETRY=10;
+          START SLAVE;
+          EOF
+          fi
+          # 使用ncat监听3307端口。
+          # 它的作用是，在收到传输请求的时候，直接执行xtrabackup --backup命令，备份MySQL的数据并发送给请求者
+          exec ncat --listen --keep-open --send-only --max-conns=1 3307 -c \
+            "xtrabackup --backup --slave-info --stream=xbstream --host=127.0.0.1 --user=root --password=${MYSQL_ROOT_PASSWORD}"
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+      volumes:
+      - name: conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      namespace: msyqlha
+      #annotations:
+      #  volume.beta.kubernetes.io/storage-class: local-storage
+    spec:
+      accessModes:
+      - "ReadWriteOnce"
+      storageClassName: managed-nfs-storage
+      resources:
+        requests:
+          storage: 10Gi
